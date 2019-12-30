@@ -10,7 +10,9 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/operator-framework/operator-sdk/pkg/ready"
+	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/tools/reference"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -19,7 +21,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
+	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 
+	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	sspv1 "github.com/MarSik/kubevirt-ssp-operator/pkg/apis/kubevirt/v1"
 	networkaddonsv1alpha1 "github.com/kubevirt/cluster-network-addons-operator/pkg/apis/networkaddonsoperator/v1alpha1"
 	networkaddonsnames "github.com/kubevirt/cluster-network-addons-operator/pkg/names"
@@ -470,7 +474,7 @@ func newCDIForCR(cr *hcov1alpha1.HyperConverged, namespace string) *cdiv1alpha1.
 
 func (r *ReconcileHyperConverged) ensureCDI(instance *hcov1alpha1.HyperConverged, logger logr.Logger, request reconcile.Request) error {
 	cdi := newCDIForCR(instance, UndefinedNamespace)
-	if err := controllerutil.SetControllerReference(instance, cdi, r.scheme); err != nil {
+	if err := removeControllerReferences(instance, cdi, r.scheme); err != nil {
 		return err
 	}
 
@@ -1075,6 +1079,34 @@ func (r *ReconcileHyperConverged) ensureKubeVirtMetricsAggregation(instance *hco
 
 	handleConditionsSSP(r, logger, "KubevirtMetricsAggregation", &found.Status)
 	return r.client.Status().Update(context.TODO(), instance)
+}
+
+func removeControllerReferences(owner, object v1.Object, scheme *runtime.Scheme) error {
+	newRefs := []v1.OwnerReference{}
+	ro, ok := owner.(runtime.Object)
+	if !ok {
+		return fmt.Errorf("is not a %T a runtime.Object, cannot call SetControllerReference", owner)
+	}
+
+	gvk, err := apiutil.GVKForObject(ro, scheme)
+	if err != nil {
+		return err
+	}
+
+	// Create a new ref
+	ref := *v1.NewControllerRef(owner, schema.GroupVersionKind{Group: gvk.Group, Version: gvk.Version, Kind: gvk.Kind})
+
+	existingRefs := object.GetOwnerReferences()
+
+	for _, r := range existingRefs {
+		if !equality.Semantic.DeepEqual(ref, r) {
+			newRefs = append(newRefs, ref)
+		}
+	}
+
+	// Update owner references
+	object.SetOwnerReferences(newRefs)
+	return nil
 }
 
 func isKVMAvailable() bool {
