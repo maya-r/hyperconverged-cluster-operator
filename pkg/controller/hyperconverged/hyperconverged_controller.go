@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/go-logr/logr"
+	"github.com/kubevirt/hyperconverged-cluster-operator/pkg/components"
 	"github.com/operator-framework/operator-sdk/pkg/ready"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/reference"
@@ -29,6 +30,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	extv1beta1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1"
 	kubevirtv1 "kubevirt.io/client-go/api/v1"
 	cdiv1alpha1 "kubevirt.io/containerized-data-importer/pkg/apis/core/v1alpha1"
 	logf "sigs.k8s.io/controller-runtime/pkg/runtime/log"
@@ -470,6 +472,9 @@ func newCDIForCR(cr *hcov1alpha1.HyperConverged, namespace string) *cdiv1alpha1.
 
 func (r *ReconcileHyperConverged) ensureCDI(instance *hcov1alpha1.HyperConverged, logger logr.Logger, request reconcile.Request) error {
 	cdi := newCDIForCR(instance, UndefinedNamespace)
+
+	// XXX remove 3 lines below before pull request.
+	// XXX used to easily test "upgrade"
 	if err := controllerutil.SetControllerReference(instance, cdi, r.scheme); err != nil {
 		return err
 	}
@@ -491,6 +496,49 @@ func (r *ReconcileHyperConverged) ensureCDI(instance *hcov1alpha1.HyperConverged
 	}
 
 	logger.Info("CDI already exists", "CDI.Namespace", found.Namespace, "CDI.Name", found.Name)
+
+	existingOwners := found.GetOwnerReferences()
+
+	// Previous versions used to have HCO-operator (scope namespace)
+	// as the owner of CDI (scope cluster).
+	// It's not legal, so remove that.
+	for _, existingOwner := range existingOwners {
+		if existingOwner.UID == instance.GetObjectMeta().GetUID() {
+			logger.Info("CDI was owned by HCO operator, remove...")
+			hcoCRD := components.GetOperatorCRD()
+			key, err := client.ObjectKeyFromObject(hcoCRD)
+			if err != nil {
+				logger.Error(err, "Failed to get object key for HCO CRD")
+			}
+
+			foundHCOCRD := &extv1beta1.CustomResourceDefinition{}
+
+			// XXX XXX find a normal place to do this!
+			// We need extv1beta1 in the scheme to access CRDs
+			extv1beta1.AddToScheme(r.scheme)
+
+			err = r.client.Get(context.TODO(), key, foundHCOCRD)
+			if err != nil {
+				logger.Error(err, "Failed to find HCO CRD")
+			}
+
+			// Delete any previous owners
+			noOwnerRefs := []metav1.OwnerReference{}
+			found.SetOwnerReferences(noOwnerRefs)
+
+			// XXX remove below
+			r.client.Update(context.TODO(), found)
+
+			logger.Info(fmt.Sprintf("Trying to set HCO CRD (%v) as owner...", foundHCOCRD))
+			// Set HCO CRD as owner
+			if err := controllerutil.SetControllerReference(foundHCOCRD, found, r.scheme); err != nil {
+				logger.Error(err, "Failed to set HCO CRD as owner!")
+			}
+
+			r.client.Update(context.TODO(), found)
+		}
+
+	}
 
 	// Add it to the list of RelatedObjects if found
 	objectRef, err := reference.GetReference(r.scheme, found)
