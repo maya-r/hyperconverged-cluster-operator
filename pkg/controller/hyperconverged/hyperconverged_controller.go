@@ -474,13 +474,13 @@ func (r *ReconcileHyperConverged) ensureCDI(instance *hcov1alpha1.HyperConverged
 		return err
 	}
 
-	key, err := client.ObjectKeyFromObject(cdi)
+	keyCDI, err := client.ObjectKeyFromObject(cdi)
 	if err != nil {
 		logger.Error(err, "Failed to get object key for CDI")
 	}
 
-	found := &cdiv1alpha1.CDI{}
-	err = r.client.Get(context.TODO(), key, found)
+	foundCDI := &cdiv1alpha1.CDI{}
+	err = r.client.Get(context.TODO(), keyCDI, foundCDI)
 	if err != nil && apierrors.IsNotFound(err) {
 		logger.Info("Creating CDI")
 		return r.client.Create(context.TODO(), cdi)
@@ -490,17 +490,17 @@ func (r *ReconcileHyperConverged) ensureCDI(instance *hcov1alpha1.HyperConverged
 		return err
 	}
 
-	logger.Info("CDI already exists", "CDI.Namespace", found.Namespace, "CDI.Name", found.Name)
+	logger.Info("CDI already exists", "CDI.Namespace", foundCDI.Namespace, "CDI.Name", foundCDI.Name)
 
 	// Add it to the list of RelatedObjects if found
-	objectRef, err := reference.GetReference(r.scheme, found)
+	objectRef, err := reference.GetReference(r.scheme, foundCDI)
 	if err != nil {
 		return err
 	}
 	objectreferencesv1.SetObjectReference(&instance.Status.RelatedObjects, *objectRef)
 
 	// Handle CDI resource conditions
-	if found.Status.Conditions == nil {
+	if foundCDI.Status.Conditions == nil {
 		logger.Info("CDI's resource is not reporting Conditions on it's Status")
 		conditionsv1.SetStatusCondition(&r.conditions, conditionsv1.Condition{
 			Type:    conditionsv1.ConditionAvailable,
@@ -521,7 +521,7 @@ func (r *ReconcileHyperConverged) ensureCDI(instance *hcov1alpha1.HyperConverged
 			Message: "CDI resource has no conditions",
 		})
 	} else {
-		for _, condition := range found.Status.Conditions {
+		for _, condition := range foundCDI.Status.Conditions {
 			// convert the CDI condition type to one we understand
 			switch conditionsv1.ConditionType(condition.Type) {
 			case conditionsv1.ConditionAvailable:
