@@ -8,9 +8,13 @@ import (
 	"reflect"
 	"strings"
 
+	"encoding/json"
 	"github.com/go-logr/logr"
 	"github.com/operator-framework/operator-sdk/pkg/ready"
+	"github.com/operator-framework/operator-sdk/pkg/k8sutil"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/reference"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -41,9 +45,7 @@ const (
 	// use finalizers to manage the cleanup.
 	FinalizerName = "hyperconvergeds.hco.kubevirt.io"
 
-	// Foreground deletion finalizer is blocking removal of HyperConverged until explicitly dropped.
-	// TODO: Research whether there is a better way.
-	foregroundDeletionFinalizer = "foregroundDeletion"
+	HyperConvergedName = "hyperconverged-cluster"
 
 	// UndefinedNamespace is for cluster scoped resources
 	UndefinedNamespace string = ""
@@ -83,6 +85,11 @@ func add(mgr manager.Manager, r reconcile.Reconciler) error {
 		return err
 	}
 
+	hco, err := GetNamespacedName()
+	if err != nil {
+		return err
+	}
+
 	// Watch secondary resources
 	for _, resource := range []runtime.Object{
 		&kubevirtv1.KubeVirt{},
@@ -93,9 +100,14 @@ func add(mgr manager.Manager, r reconcile.Reconciler) error {
 		&sspv1.KubevirtTemplateValidator{},
 		&sspv1.KubevirtMetricsAggregation{},
 	} {
-		err = c.Watch(&source.Kind{Type: resource}, &handler.EnqueueRequestForOwner{
-			IsController: true,
-			OwnerType:    &hcov1alpha1.HyperConverged{},
+		err = c.Watch(&source.Kind{Type: resource}, &handler.EnqueueRequestsFromMapFunc{
+			ToRequests: handler.ToRequestsFunc(
+				// always enqueue the same HyperConverged object, since there should be only one
+				func(a handler.MapObject) []reconcile.Request{
+					return []reconcile.Request{
+						{NamespacedName: hco},
+					}
+				}),
 		})
 		if err != nil {
 			return err
@@ -103,6 +115,32 @@ func add(mgr manager.Manager, r reconcile.Reconciler) error {
 	}
 
 	return nil
+}
+
+func manageComponentResourceRemoval(o interface{}, c client.Client, cr *hcov1alpha1.HyperConverged) (error) {
+	resource, err := toUnstructured(o)
+	if err != nil {
+		log.Error(err, "Failed to convert object to Unstructured")
+		return err
+	}
+
+	err = c.Get(context.TODO(), types.NamespacedName{Name: resource.GetName(), Namespace: resource.GetNamespace()}, resource)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			log.Info("Resource doesn't exist, there is nothing to remove", "Kind", resource.GetObjectKind())
+			return nil
+		}
+		return err
+	}
+
+	labels := resource.GetLabels()
+	if app, labelExists := labels["app"]; !labelExists || app != cr.Name {
+		log.Info("Existing resource wasn't deployed by HCO, ignoring", "Kind", resource.GetObjectKind())
+		return nil
+	}
+
+	err = c.Delete(context.TODO(), resource)
+	return err
 }
 
 var _ reconcile.Reconciler = &ReconcileHyperConverged{}
@@ -187,6 +225,16 @@ func (r *ReconcileHyperConverged) Reconcile(request reconcile.Request) (reconcil
 	// negative conditions (!Available, Degraded, Progressing)
 	r.conditions = nil
 
+	// Handle finalizers
+	if instance.ObjectMeta.DeletionTimestamp.IsZero() {
+		// Add the finalizer if it's not there
+		if !contains(instance.ObjectMeta.Finalizers, FinalizerName) {
+			instance.ObjectMeta.Finalizers = append(instance.ObjectMeta.Finalizers, FinalizerName)
+			// Need to requeue because finalizer update does not change metadata.generation
+			return reconcile.Result{}, r.client.Update(context.TODO(), instance)
+		}
+	} // else is handled in each controller function
+
 	for _, f := range []func(*hcov1alpha1.HyperConverged, logr.Logger, reconcile.Request) error{
 		r.ensureKubeVirtConfig,
 		r.ensureKubeVirtStorageConfig,
@@ -215,6 +263,15 @@ func (r *ReconcileHyperConverged) Reconcile(request reconcile.Request) (reconcil
 			return reconcile.Result{}, err
 		}
 	}
+
+	if !instance.ObjectMeta.DeletionTimestamp.IsZero() {
+		// Already handled removing the objects in their reconcile functions.
+                // Remove the finalizer
+                instance.ObjectMeta.Finalizers = drop(instance.ObjectMeta.Finalizers, FinalizerName)
+
+                // Need to requeue because finalizer update does not change metadata.generation
+                return reconcile.Result{}, r.client.Update(context.TODO(), instance)
+        }
 
 	reqLogger.Info("Reconcile complete")
 	conditionsv1.SetStatusCondition(&instance.Status.Conditions, conditionsv1.Condition{
@@ -470,9 +527,6 @@ func newCDIForCR(cr *hcov1alpha1.HyperConverged, namespace string) *cdiv1alpha1.
 
 func (r *ReconcileHyperConverged) ensureCDI(instance *hcov1alpha1.HyperConverged, logger logr.Logger, request reconcile.Request) error {
 	cdi := newCDIForCR(instance, UndefinedNamespace)
-	if err := controllerutil.SetControllerReference(instance, cdi, r.scheme); err != nil {
-		return err
-	}
 
 	key, err := client.ObjectKeyFromObject(cdi)
 	if err != nil {
@@ -481,6 +535,18 @@ func (r *ReconcileHyperConverged) ensureCDI(instance *hcov1alpha1.HyperConverged
 
 	found := &cdiv1alpha1.CDI{}
 	err = r.client.Get(context.TODO(), key, found)
+
+	// Handle HCO finalizer
+	if !instance.ObjectMeta.DeletionTimestamp.IsZero() {
+		errRemoval := manageComponentResourceRemoval(found, r.client, instance)
+		if errRemoval != nil {
+			logger.Error(err, "Failed during CDI removal")
+			return errRemoval
+		}
+
+		return r.client.Update(context.TODO(), instance)
+	}
+
 	if err != nil && apierrors.IsNotFound(err) {
 		logger.Info("Creating CDI")
 		return r.client.Create(context.TODO(), cdi)
@@ -491,6 +557,17 @@ func (r *ReconcileHyperConverged) ensureCDI(instance *hcov1alpha1.HyperConverged
 	}
 
 	logger.Info("CDI already exists", "CDI.Namespace", found.Namespace, "CDI.Name", found.Name)
+
+	existingOwners := found.GetOwnerReferences()
+
+	// Previous versions used to have HCO-operator (scope namespace)
+	// as the owner of CDI (scope cluster).
+	// It's not legal, so remove that.
+	if (len(existingOwners) > 0) {
+		logger.Info("CDI has owners, removing...")
+		found.SetOwnerReferences([]metav1.OwnerReference{})
+		r.client.Update(context.TODO(), found)
+	}
 
 	// Add it to the list of RelatedObjects if found
 	objectRef, err := reference.GetReference(r.scheme, found)
@@ -590,9 +667,6 @@ func newNetworkAddonsForCR(cr *hcov1alpha1.HyperConverged, namespace string) *ne
 
 func (r *ReconcileHyperConverged) ensureNetworkAddons(instance *hcov1alpha1.HyperConverged, logger logr.Logger, request reconcile.Request) error {
 	networkAddons := newNetworkAddonsForCR(instance, UndefinedNamespace)
-	if err := controllerutil.SetControllerReference(instance, networkAddons, r.scheme); err != nil {
-		return err
-	}
 
 	key, err := client.ObjectKeyFromObject(networkAddons)
 	if err != nil {
@@ -601,6 +675,18 @@ func (r *ReconcileHyperConverged) ensureNetworkAddons(instance *hcov1alpha1.Hype
 
 	found := &networkaddonsv1alpha1.NetworkAddonsConfig{}
 	err = r.client.Get(context.TODO(), key, found)
+
+	// Handle HCO finalizer
+	if !instance.ObjectMeta.DeletionTimestamp.IsZero() {
+		errRemoval := manageComponentResourceRemoval(found, r.client, instance)
+		if errRemoval != nil {
+			logger.Error(err, "Failed during NetworkAddonsConfig removal")
+			return errRemoval
+		}
+
+		return r.client.Update(context.TODO(), instance)
+	}
+
 	if err != nil && apierrors.IsNotFound(err) {
 		logger.Info("Creating Network Addons")
 		return r.client.Create(context.TODO(), networkAddons)
@@ -1084,4 +1170,51 @@ func isKVMAvailable() bool {
 	}
 	log.Info("Running with KVM available")
 	return true
+}
+
+// GetNamespacedName returns the name/namespace of the HyperConverged resource
+func GetNamespacedName() (types.NamespacedName, error) {
+	hco := types.NamespacedName{
+		Name: HyperConvergedName,
+	}
+
+	namespace, err := k8sutil.GetOperatorNamespace()
+	if err != nil {
+		return hco, err
+	}
+	hco.Namespace = namespace
+	return hco, nil
+}
+
+func contains(l []string, s string) bool {
+	for _, elem := range l {
+		if elem == s {
+			return true
+		}
+	}
+	return false
+}
+
+func drop(l []string, s string) []string {
+	newL := []string{}
+	for _, elem := range l {
+		if elem != s {
+			newL = append(newL, elem)
+		}
+	}
+	return newL
+}
+
+// toUnstructured convers an arbitrary object (which MUST obey the
+// k8s object conventions) to an Unstructured
+func toUnstructured(obj interface{}) (*unstructured.Unstructured, error) {
+	b, err := json.Marshal(obj)
+	if err != nil {
+		return nil, err
+	}
+	u := &unstructured.Unstructured{}
+	if err := json.Unmarshal(b, u); err != nil {
+		return nil, err
+	}
+	return u, nil
 }
