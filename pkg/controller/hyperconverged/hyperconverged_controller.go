@@ -117,32 +117,6 @@ func add(mgr manager.Manager, r reconcile.Reconciler) error {
 	return nil
 }
 
-func manageComponentResourceRemoval(o interface{}, c client.Client, cr *hcov1alpha1.HyperConverged) (error) {
-	resource, err := toUnstructured(o)
-	if err != nil {
-		log.Error(err, "Failed to convert object to Unstructured")
-		return err
-	}
-
-	err = c.Get(context.TODO(), types.NamespacedName{Name: resource.GetName(), Namespace: resource.GetNamespace()}, resource)
-	if err != nil {
-		if apierrors.IsNotFound(err) {
-			log.Info("Resource doesn't exist, there is nothing to remove", "Kind", resource.GetObjectKind())
-			return nil
-		}
-		return err
-	}
-
-	labels := resource.GetLabels()
-	if app, labelExists := labels["app"]; !labelExists || app != cr.Name {
-		log.Info("Existing resource wasn't deployed by HCO, ignoring", "Kind", resource.GetObjectKind())
-		return nil
-	}
-
-	err = c.Delete(context.TODO(), resource)
-	return err
-}
-
 var _ reconcile.Reconciler = &ReconcileHyperConverged{}
 
 // ReconcileHyperConverged reconciles a HyperConverged object
@@ -233,7 +207,24 @@ func (r *ReconcileHyperConverged) Reconcile(request reconcile.Request) (reconcil
 			// Need to requeue because finalizer update does not change metadata.generation
 			return reconcile.Result{}, r.client.Update(context.TODO(), instance)
 		}
-	} // else is handled in each controller function
+	} else {
+		for _, f := range []func(c client.Client, cr *hcov1alpha1.HyperConverged) error{
+			ensureCDIDeleted,
+			ensureNetworkAddonsDeleted,
+		} {
+			err = f(r.client, instance)
+			if err != nil {
+				reqLogger.Error(err, "Failed to manually deleted objects")
+				return reconcile.Result{}, err
+			}
+		}
+
+		// Remove the finalizer
+                instance.ObjectMeta.Finalizers = drop(instance.ObjectMeta.Finalizers, FinalizerName)
+
+                // Need to requeue because finalizer update does not change metadata.generation
+                return reconcile.Result{}, r.client.Update(context.TODO(), instance)
+	}
 
 	for _, f := range []func(*hcov1alpha1.HyperConverged, logr.Logger, reconcile.Request) error{
 		r.ensureKubeVirtConfig,
@@ -266,11 +257,6 @@ func (r *ReconcileHyperConverged) Reconcile(request reconcile.Request) (reconcil
 
 	if !instance.ObjectMeta.DeletionTimestamp.IsZero() {
 		// Already handled removing the objects in their reconcile functions.
-                // Remove the finalizer
-                instance.ObjectMeta.Finalizers = drop(instance.ObjectMeta.Finalizers, FinalizerName)
-
-                // Need to requeue because finalizer update does not change metadata.generation
-                return reconcile.Result{}, r.client.Update(context.TODO(), instance)
         }
 
 	reqLogger.Info("Reconcile complete")
@@ -536,17 +522,6 @@ func (r *ReconcileHyperConverged) ensureCDI(instance *hcov1alpha1.HyperConverged
 	found := &cdiv1alpha1.CDI{}
 	err = r.client.Get(context.TODO(), key, found)
 
-	// Handle HCO finalizer
-	if !instance.ObjectMeta.DeletionTimestamp.IsZero() {
-		errRemoval := manageComponentResourceRemoval(found, r.client, instance)
-		if errRemoval != nil {
-			logger.Error(err, "Failed during CDI removal")
-			return errRemoval
-		}
-
-		return r.client.Update(context.TODO(), instance)
-	}
-
 	if err != nil && apierrors.IsNotFound(err) {
 		logger.Info("Creating CDI")
 		return r.client.Create(context.TODO(), cdi)
@@ -566,7 +541,10 @@ func (r *ReconcileHyperConverged) ensureCDI(instance *hcov1alpha1.HyperConverged
 	if (len(existingOwners) > 0) {
 		logger.Info("CDI has owners, removing...")
 		found.SetOwnerReferences([]metav1.OwnerReference{})
-		r.client.Update(context.TODO(), found)
+		err = r.client.Update(context.TODO(), found)
+		if err != nil {
+			logger.Error(err, "Failed to remove CDI's previous owners")
+		}
 	}
 
 	// Add it to the list of RelatedObjects if found
@@ -676,22 +654,25 @@ func (r *ReconcileHyperConverged) ensureNetworkAddons(instance *hcov1alpha1.Hype
 	found := &networkaddonsv1alpha1.NetworkAddonsConfig{}
 	err = r.client.Get(context.TODO(), key, found)
 
-	// Handle HCO finalizer
-	if !instance.ObjectMeta.DeletionTimestamp.IsZero() {
-		errRemoval := manageComponentResourceRemoval(found, r.client, instance)
-		if errRemoval != nil {
-			logger.Error(err, "Failed during NetworkAddonsConfig removal")
-			return errRemoval
-		}
-
-		return r.client.Update(context.TODO(), instance)
-	}
-
 	if err != nil && apierrors.IsNotFound(err) {
 		logger.Info("Creating Network Addons")
 		return r.client.Create(context.TODO(), networkAddons)
 	} else if err != nil {
 		return err
+	}
+
+	existingOwners := found.GetOwnerReferences()
+
+	// Previous versions used to have HCO-operator (scope namespace)
+	// as the owner of NetworkAddons (scope cluster).
+	// It's not legal, so remove that.
+	if (len(existingOwners) > 0) {
+		logger.Info("NetworkAddons has owners, removing...")
+		found.SetOwnerReferences([]metav1.OwnerReference{})
+		err = r.client.Update(context.TODO(), found)
+		if err != nil {
+			logger.Error(err, "Failed to remove CDI's previous owners")
+		}
 	}
 
 	if !reflect.DeepEqual(found.Spec, networkAddons.Spec) {
@@ -1217,4 +1198,40 @@ func toUnstructured(obj interface{}) (*unstructured.Unstructured, error) {
 		return nil, err
 	}
 	return u, nil
+}
+
+func componentResourceRemoval(o interface{}, c client.Client, cr *hcov1alpha1.HyperConverged) (error) {
+	resource, err := toUnstructured(o)
+	if err != nil {
+		log.Error(err, "Failed to convert object to Unstructured")
+		return err
+	}
+
+	err = c.Get(context.TODO(), types.NamespacedName{Name: resource.GetName(), Namespace: resource.GetNamespace()}, resource)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			log.Info("Resource doesn't exist, there is nothing to remove", "Kind", resource.GetObjectKind())
+			return nil
+		}
+		return err
+	}
+
+	labels := resource.GetLabels()
+	if app, labelExists := labels["app"]; !labelExists || app != cr.Name {
+		log.Info("Existing resource wasn't deployed by HCO, ignoring", "Kind", resource.GetObjectKind())
+		return nil
+	}
+
+	err = c.Delete(context.TODO(), resource)
+	return err
+}
+
+func ensureCDIDeleted(c client.Client, instance *hcov1alpha1.HyperConverged) (error) {
+	cdi := newCDIForCR(instance, UndefinedNamespace)
+	return componentResourceRemoval(cdi, c, instance)
+}
+
+func ensureNetworkAddonsDeleted(c client.Client, instance *hcov1alpha1.HyperConverged) (error) {
+	networkAddons := newNetworkAddonsForCR(instance, UndefinedNamespace)
+	return componentResourceRemoval(networkAddons, c, instance)
 }
